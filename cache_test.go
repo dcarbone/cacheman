@@ -42,4 +42,19 @@ func TestCacheMan(t *testing.T) {
 		_ = basicCacheMan(t)
 	})
 
+	t.Run("get-key", func(t *testing.T) {
+		m := basicCacheMan(t)
+
+		v, err := m.Get("test")
+		if err != nil {
+			t.Logf("Error getting initial key: %v", err)
+			t.Fail()
+		} else if i, ok := v.(uint64); !ok {
+			t.Logf("Expected v to be uint64, saw %T", v)
+			t.Fail()
+		} else if i != 1 {
+			t.Logf("Expected i to be 1, saw %d", i)
+			t.Fail()
+		}
+	})
 }

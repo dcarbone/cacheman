@@ -81,7 +81,7 @@ func newKeyManager(l *log.Logger, key interface{}, act RebuildActionFunc, be Bac
 	if l == nil {
 		km.log = log.New(ioutil.Discard, "", 0)
 	} else {
-		log.New(l.Writer(), fmt.Sprintf(KeyManagerLogPrefixFormat, key), l.Flags())
+		km.log = log.New(l.Writer(), fmt.Sprintf(KeyManagerLogPrefixFormat, key), l.Flags())
 	}
 
 	go km.manage()
