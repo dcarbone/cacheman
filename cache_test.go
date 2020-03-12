@@ -3,9 +3,11 @@ package cacheman_test
 import (
 	"log"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dcarbone/go-cacheman"
 )
@@ -36,6 +38,18 @@ func basicCacheMan(t *testing.T, mu ...func(*cacheman.Config)) *cacheman.CacheMa
 	}
 }
 
+func testEquals(t *testing.T, m *cacheman.CacheMan, key, expected interface{}) {
+	if v, err := m.Get(key); err != nil {
+		t.Logf("Error getting key \"%v\": %v", key, err)
+		t.Fail()
+	} else if reflect.TypeOf(v) != reflect.TypeOf(expected) {
+		t.Logf("Key \"%v\" value type mismatch: expected=%T; actual=%T", key, expected, v)
+	} else if expected != v {
+		t.Logf("Key \"%v\" value mismatch: expected=%v; acutal=%v", key, expected, v)
+		t.Fail()
+	}
+}
+
 func TestCacheMan(t *testing.T) {
 	t.Run("test-init-sane", func(t *testing.T) {
 		_ = basicCacheMan(t)
@@ -43,43 +57,37 @@ func TestCacheMan(t *testing.T) {
 
 	t.Run("get-key", func(t *testing.T) {
 		m := basicCacheMan(t)
-
-		v, err := m.Get("test")
-		if err != nil {
-			t.Logf("Error getting initial key: %v", err)
-			t.Fail()
-		} else if i, ok := v.(uint64); !ok {
-			t.Logf("Expected v to be uint64, saw %T", v)
-			t.Fail()
-		} else if i != 1 {
-			t.Logf("Expected i to be 1, saw %d", i)
-			t.Fail()
-		}
+		testEquals(t, m, "test", 1)
 	})
 
 	t.Run("get-key-again", func(t *testing.T) {
 		m := basicCacheMan(t)
 
-		if v, err := m.Get("test"); err != nil {
-			t.Logf("Error getting initial key: %v", err)
-			t.Fail()
-		} else if i, ok := v.(uint64); !ok {
-			t.Logf("Expected v to be uint64, saw %T", v)
-			t.Fail()
-		} else if i != 1 {
-			t.Logf("Expected i to be 1, saw %d", i)
-			t.Fail()
+		testEquals(t, m, "test", 1)
+
+		if t.Failed() {
+			return
 		}
 
-		if v, err := m.Get("test"); err != nil {
-			t.Logf("Error getting initial key again: %v", err)
-			t.Fail()
-		} else if i, ok := v.(uint64); !ok {
-			t.Logf("Expected v to be uint64 again, saw %T", v)
-			t.Fail()
-		} else if i != 1 {
-			t.Logf("Expected i to be 1 again, saw %d", i)
-			t.Fail()
+		testEquals(t, m, "test", 1)
+	})
+
+	t.Run("manager-times-out", func(t *testing.T) {
+		m := basicCacheMan(t, func(config *cacheman.Config) {
+			config.IdleTimeout = time.Second
+			config.TimeoutBehavior = cacheman.TimeoutBehaviorDelete
+		})
+
+		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", 1)
+
+		if t.Failed() {
+			return
 		}
+
+		time.Sleep(2 * time.Second)
+
+		testEquals(t, m, "test", 2)
+		testEquals(t, m, "test", 2)
 	})
 }
