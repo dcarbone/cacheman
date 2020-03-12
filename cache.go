@@ -46,86 +46,120 @@ type Config struct {
 	// This is used to actually store the data.  If one is not provided, a new sync.Map instance is used.
 	Backend Backend
 
-	// ManagerTTL [optional]
+	// IdleTimeout [optional]
 	//
-	// Amount of time a given key manager is to remain alive
-	ManagerTTL time.Duration
+	// Amount of time for this manager and key to exist past last fetch request
+	IdleTimeout time.Duration
+
+	// TimeoutBehavior [optional]
+	//
+	// Behavior of manager timeout
+	TimeoutBehavior TimeoutBehavior
 
 	// Logger [optional]
 	//
 	// If you want logging, define this.
 	Logger *log.Logger
+}
 
-	// Debug [optional]
-	//
-	// If true and if there is a logger, enables verbose logging
-	Debug bool
+func buildConfig(inc *Config, mu ...func(*Config)) *Config {
+	actual := new(Config)
+
+	if inc == nil {
+		inc = new(Config)
+	}
+
+	for _, fn := range mu {
+		fn(inc)
+	}
+
+	actual.RebuildAction = inc.RebuildAction
+	actual.Backend = inc.Backend
+	actual.IdleTimeout = inc.IdleTimeout
+	actual.TimeoutBehavior = inc.TimeoutBehavior
+	actual.Logger = inc.Logger
+
+	return actual
 }
 
 type CacheMan struct {
 	mu  sync.RWMutex
 	log *log.Logger
-	dbg bool
-	act RebuildActionFunc
-	req chan *request
-	cln chan interface{}
-	man map[interface{}]*KeyManager
 	be  Backend
+
+	requests chan *request
+	cleanup  chan interface{}
+
+	rebuildAction RebuildActionFunc
+
+	managers    map[interface{}]*keyManager
+	idleTTL     time.Duration
+	ttlBehavior TimeoutBehavior
 }
 
-func New(config *Config) (*CacheMan, error) {
-	var (
-		c = new(CacheMan)
-	)
+func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
+
+	config := buildConfig(c, mutators...)
 
 	if config.RebuildAction == nil {
 		return nil, errors.New("RebuildAction cannot be nil")
 	}
 
-	if config.Logger != nil {
-		c.log = log.New(config.Logger.Writer(), LogPrefix, config.Logger.Flags())
-	} else {
-		c.log = log.New(ioutil.Discard, LogPrefix, log.Lmsgprefix|log.LstdFlags)
-	}
+	cm := new(CacheMan)
 
-	c.dbg = config.Debug
-	c.act = config.RebuildAction
-	c.req = make(chan *request, 100)
-	c.cln = make(chan interface{}, 100)
-	c.man = make(map[interface{}]*KeyManager)
+	cm.rebuildAction = config.RebuildAction
+	cm.ttlBehavior = config.TimeoutBehavior
+	cm.requests = make(chan *request, 100)
+	cm.cleanup = make(chan interface{}, 100)
+	cm.managers = make(map[interface{}]*keyManager)
+
+	if config.Logger != nil {
+		cm.log = log.New(config.Logger.Writer(), LogPrefix, config.Logger.Flags())
+	} else {
+		cm.log = log.New(ioutil.Discard, LogPrefix, log.Lmsgprefix|log.LstdFlags)
+	}
 
 	if config.Backend == nil {
-		c.be = new(sync.Map)
+		cm.be = new(sync.Map)
 	} else {
-		c.be = config.Backend
+		cm.be = config.Backend
 	}
 
-	go c.run()
+	if config.IdleTimeout > 0 {
+		cm.idleTTL = config.IdleTimeout
+	} else {
+		cm.idleTTL = DefaultManagerIdleTimeout
+	}
 
-	return c, nil
+	go cm.run()
+
+	return cm, nil
 }
 
 // Get will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
-func (c *CacheMan) Get(key interface{}) (interface{}, error) {
+func (cm *CacheMan) Get(key interface{}) (interface{}, error) {
 	resp := make(chan *response, 1)
-	defer close(resp)
-	c.req <- &request{key: key, resp: resp}
+	cm.requests <- &request{key: key, resp: resp}
 	r := <-resp
+	close(resp)
 	return r.data, r.err
 }
 
-func (c *CacheMan) manage(key interface{}) *KeyManager {
-	c.man[key] = NewKeyManager(c.log, c.dbg, key, c.act, c.be, c.cln)
-	return c.man[key]
+func (cm *CacheMan) Unmanage(key interface{}) {
+	cm.cleanup <- key
 }
 
-func (c *CacheMan) logf(debug bool, f string, v ...interface{}) {
-	if !debug || c.dbg {
-		c.log.Printf(f, v...)
-	}
+func (cm *CacheMan) manage(key interface{}) *keyManager {
+	m := newKeyManager(cm.log, key, cm.rebuildAction, cm.be, cm.idleTTL, cm.ttlBehavior)
+	cm.managers[key] = m
+	go func() {
+		<-m.done
+		cm.cleanup <- m.key
+	}()
+	return m
 }
 
-func (c *CacheMan) run() {
+func (cm *CacheMan) run() {
 	const hbInterval = time.Minute
 
 	var (
@@ -136,32 +170,32 @@ func (c *CacheMan) run() {
 
 	for {
 		select {
-		case req := <-c.req:
+		case req := <-cm.requests:
 			var (
-				m  *KeyManager
+				m  *keyManager
 				ok bool
 			)
 
-			if m, ok = c.man[req.key]; !ok {
-				c.logf(true, "No manager present for key %q, creating...")
-				m = c.manage(req.key)
+			if m, ok = cm.managers[req.key]; !ok {
+				cm.log.Printf("No manager present for key \"%v\", creating...", req.key)
+				m = cm.manage(req.key)
 			} else if m.Closed() {
-				c.logf(true, "Manager for %q is still in map, but marked as closed.  Will replace...", req.key)
-				m = c.manage(req.key)
+				cm.log.Printf("Manager for \"%v\" is still in map, but marked as closed.  Will replace...", req.key)
+				m = cm.manage(req.key)
 			}
 
-			go requestFromManager(c.logf, m, req)
+			go requestFromManager(cm.log.Printf, m, req)
 
-		case key := <-c.cln:
-			if m, ok := c.man[key]; ok && m.Closed() {
-				c.logf(true, "Cache key %q hasn't been hit for awhile, shutting it down...", key)
-				delete(c.man, key)
+		case key := <-cm.cleanup:
+			if m, ok := cm.managers[key]; ok && m.Closed() {
+				cm.log.Printf("Cache key \"%v\" hasn't been hit for awhile, shutting it down...", key)
+				delete(cm.managers, key)
 			} else {
-				c.logf(true, "Received cleanup request for manager of %q, but it either isn't in the map or has been superseded.  Moving on...", key)
+				cm.log.Printf("Received cleanup request for manager of \"%v\", but it either isn't in the map or has been superseded.  Moving on...", key)
 			}
 
 		case tick = <-heartbeat.C:
-			c.logf(true, "The time is %s and I'm currently holding on to %d key managers...", tick.Format(time.Kitchen), len(c.man))
+			cm.log.Printf("The time is %s and I'm currently holding on to %d key managers...", tick.Format(time.Kitchen), len(cm.managers))
 			heartbeat.Reset(hbInterval)
 		}
 	}
