@@ -10,17 +10,16 @@ import (
 	"github.com/dcarbone/go-cacheman"
 )
 
-var (
-	atomicVal uint64
-)
-
-func basicRebuildAction(_ interface{}) (interface{}, error) {
-	return atomic.AddUint64(&atomicVal, 1), nil
+func basicRebuildAction() cacheman.RebuildActionFunc {
+	var atomicVal uint64
+	return func(_ interface{}) (data interface{}, err error) {
+		return atomic.AddUint64(&atomicVal, 1), nil
+	}
 }
 
 func defaultConfig() *cacheman.Config {
 	return &cacheman.Config{
-		RebuildAction:   basicRebuildAction,
+		RebuildAction:   basicRebuildAction(),
 		Backend:         new(sync.Map),
 		IdleTimeout:     cacheman.DefaultManagerIdleTimeout,
 		TimeoutBehavior: cacheman.TimeoutBehaviorNoAction,
@@ -54,6 +53,32 @@ func TestCacheMan(t *testing.T) {
 			t.Fail()
 		} else if i != 1 {
 			t.Logf("Expected i to be 1, saw %d", i)
+			t.Fail()
+		}
+	})
+
+	t.Run("get-key-again", func(t *testing.T) {
+		m := basicCacheMan(t)
+
+		if v, err := m.Get("test"); err != nil {
+			t.Logf("Error getting initial key: %v", err)
+			t.Fail()
+		} else if i, ok := v.(uint64); !ok {
+			t.Logf("Expected v to be uint64, saw %T", v)
+			t.Fail()
+		} else if i != 1 {
+			t.Logf("Expected i to be 1, saw %d", i)
+			t.Fail()
+		}
+
+		if v, err := m.Get("test"); err != nil {
+			t.Logf("Error getting initial key again: %v", err)
+			t.Fail()
+		} else if i, ok := v.(uint64); !ok {
+			t.Logf("Expected v to be uint64 again, saw %T", v)
+			t.Fail()
+		} else if i != 1 {
+			t.Logf("Expected i to be 1 again, saw %d", i)
 			t.Fail()
 		}
 	})

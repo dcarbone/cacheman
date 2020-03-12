@@ -176,11 +176,9 @@ func (cm *CacheMan) run() {
 				ok bool
 			)
 
-			if m, ok = cm.managers[req.key]; !ok {
-				cm.log.Printf("No manager present for key \"%v\", creating...", req.key)
-				m = cm.manage(req.key)
-			} else if m.Closed() {
-				cm.log.Printf("Manager for \"%v\" is still in map, but marked as closed.  Will replace...", req.key)
+			m, ok = cm.managers[req.key]
+			if !ok || m.Closed() {
+				cm.log.Printf("No active manager present for key \"%v\", creating...", req.key)
 				m = cm.manage(req.key)
 			}
 
