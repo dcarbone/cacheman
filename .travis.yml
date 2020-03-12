@@ -1,0 +1,19 @@
+language: go
+dist: xenial
+sudo: false
+go:
+  - 1.13.x
+  - 1.14.x
+
+env:
+  global:
+    - GOFLAGS="-mod=vendor"
+
+install:
+  - go mod vendor
+
+before_script:
+  - go vet ./
+
+script:
+  - go test -race -v

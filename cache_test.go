@@ -72,7 +72,25 @@ func TestCacheMan(t *testing.T) {
 		testEquals(t, m, "test", 1)
 	})
 
-	t.Run("manager-times-out", func(t *testing.T) {
+	t.Run("manager-timeout", func(t *testing.T) {
+		m := basicCacheMan(t, func(config *cacheman.Config) {
+			config.IdleTimeout = time.Second
+		})
+
+		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", 1)
+
+		if t.Failed() {
+			return
+		}
+
+		time.Sleep(2 * time.Second)
+
+		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", 1)
+	})
+
+	t.Run("manager-timeout-delete", func(t *testing.T) {
 		m := basicCacheMan(t, func(config *cacheman.Config) {
 			config.IdleTimeout = time.Second
 			config.TimeoutBehavior = cacheman.TimeoutBehaviorDelete
