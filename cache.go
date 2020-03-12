@@ -1,7 +1,6 @@
 package cacheman
 
 import (
-	"context"
 	"errors"
 	"io/ioutil"
 	"log"
@@ -36,9 +35,9 @@ type Backend interface {
 	Delete(key interface{})
 }
 
-type ExpirableBackend interface {
+type DeadlineBackend interface {
 	Backend
-	StoreCtx(ctx context.Context, key, value interface{})
+	StoreUntil(deadline time.Time, key, value interface{})
 }
 
 type Config struct {
