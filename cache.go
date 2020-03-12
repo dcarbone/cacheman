@@ -1,6 +1,7 @@
 package cacheman
 
 import (
+	"context"
 	"errors"
 	"io/ioutil"
 	"log"
@@ -33,6 +34,11 @@ type Backend interface {
 	Store(key, value interface{})
 	Load(key interface{}) (value interface{}, ok bool)
 	Delete(key interface{})
+}
+
+type ExpirableBackend interface {
+	Backend
+	StoreCtx(ctx context.Context, key, value interface{})
 }
 
 type Config struct {
