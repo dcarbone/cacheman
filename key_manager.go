@@ -193,7 +193,7 @@ func (km *keyManager) manage() {
 
 			if v, ok = km.be.Load(req.key); !ok {
 				if km.closed {
-					km.log.Printf("Request received after being closed")
+					km.log.Printf("Value not found but I am closed, will not rebuild.")
 					err = ErrKeyMangerClosed
 				} else {
 					km.rebuildCount++
