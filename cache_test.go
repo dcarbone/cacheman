@@ -14,8 +14,8 @@ import (
 
 func basicRebuildAction() cacheman.RebuildActionFunc {
 	var atomicVal uint64
-	return func(_ interface{}) (data interface{}, err error) {
-		return atomic.AddUint64(&atomicVal, 1), nil
+	return func(_ interface{}) (data interface{}, ttl time.Duration, err error) {
+		return atomic.AddUint64(&atomicVal, 1), 0, nil
 	}
 }
 
@@ -44,6 +44,7 @@ func testEquals(t *testing.T, m *cacheman.CacheMan, key, expected interface{}) {
 		t.Fail()
 	} else if reflect.TypeOf(v) != reflect.TypeOf(expected) {
 		t.Logf("Key \"%v\" value type mismatch: expected=%T; actual=%T", key, expected, v)
+		t.Fail()
 	} else if expected != v {
 		t.Logf("Key \"%v\" value mismatch: expected=%v; acutal=%v", key, expected, v)
 		t.Fail()
@@ -57,19 +58,19 @@ func TestCacheMan(t *testing.T) {
 
 	t.Run("get-key", func(t *testing.T) {
 		m := basicCacheMan(t)
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
 	})
 
 	t.Run("get-key-again", func(t *testing.T) {
 		m := basicCacheMan(t)
 
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
 
 		if t.Failed() {
 			return
 		}
 
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
 	})
 
 	t.Run("manager-timeout", func(t *testing.T) {
@@ -77,8 +78,8 @@ func TestCacheMan(t *testing.T) {
 			config.IdleTimeout = time.Second
 		})
 
-		testEquals(t, m, "test", 1)
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
+		testEquals(t, m, "test", uint64(1))
 
 		if t.Failed() {
 			return
@@ -86,8 +87,8 @@ func TestCacheMan(t *testing.T) {
 
 		time.Sleep(2 * time.Second)
 
-		testEquals(t, m, "test", 1)
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
+		testEquals(t, m, "test", uint64(1))
 	})
 
 	t.Run("manager-timeout-delete", func(t *testing.T) {
@@ -96,8 +97,8 @@ func TestCacheMan(t *testing.T) {
 			config.TimeoutBehavior = cacheman.TimeoutBehaviorDelete
 		})
 
-		testEquals(t, m, "test", 1)
-		testEquals(t, m, "test", 1)
+		testEquals(t, m, "test", uint64(1))
+		testEquals(t, m, "test", uint64(1))
 
 		if t.Failed() {
 			return
@@ -105,7 +106,7 @@ func TestCacheMan(t *testing.T) {
 
 		time.Sleep(2 * time.Second)
 
-		testEquals(t, m, "test", 2)
-		testEquals(t, m, "test", 2)
+		testEquals(t, m, "test", uint64(2))
+		testEquals(t, m, "test", uint64(2))
 	})
 }

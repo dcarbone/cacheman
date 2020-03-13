@@ -27,7 +27,7 @@ type request struct {
 	resp chan *response
 }
 
-type RebuildActionFunc func(key interface{}) (data interface{}, err error)
+type RebuildActionFunc func(key interface{}) (data interface{}, ttl time.Duration, err error)
 
 type Backend interface {
 	Store(key, value interface{})
@@ -37,7 +37,12 @@ type Backend interface {
 
 type DeadlineBackend interface {
 	Backend
-	StoreUntil(deadline time.Time, key, value interface{})
+	StoreUntil(key, value interface{}, deadline time.Time)
+}
+
+type TTLBackend interface {
+	Backend
+	StoreFor(key, value interface{}, ttl time.Duration)
 }
 
 type Config struct {
