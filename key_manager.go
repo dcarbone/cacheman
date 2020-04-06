@@ -181,6 +181,7 @@ func (km *keyManager) manage() {
 		case req := <-km.requests:
 			var (
 				v   interface{}
+				ttl time.Duration
 				ok  bool
 				err error
 			)
@@ -192,13 +193,23 @@ func (km *keyManager) manage() {
 
 			if v, ok = km.be.Load(req.key); !ok {
 				if km.closed {
-					km.log.Printf("Request received after being closed")
+					km.log.Printf("Value not found but I am closed, will not rebuild.")
 					err = ErrKeyMangerClosed
 				} else {
 					km.rebuildCount++
 					km.lastRebuilt = time.Now()
-					if v, err = km.rebuildAction(req.key); err == nil {
-						km.be.Store(req.key, v)
+					if v, ttl, err = km.rebuildAction(req.key); err == nil {
+						if ttl > 0 {
+							if tb, ok := km.be.(TTLBackend); ok {
+								tb.StoreFor(req.key, v, ttl)
+							} else if db, ok := km.be.(DeadlineBackend); ok {
+								db.StoreUntil(req.key, v, time.Now().Add(ttl))
+							} else {
+								km.be.Store(req.key, v)
+							}
+						} else {
+							km.be.Store(req.key, v)
+						}
 					}
 				}
 			}
