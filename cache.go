@@ -14,7 +14,7 @@ const (
 
 var (
 	LogPrefix                 = "-> cacheman "
-	KeyManagerLogPrefixFormat = "--> cacheman-km-%s "
+	KeyManagerLogPrefixFormat = "--> cacheman-km-%v "
 )
 
 type response struct {
