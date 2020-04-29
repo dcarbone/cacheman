@@ -28,6 +28,7 @@ type request struct {
 }
 
 type RebuildActionFunc func(key interface{}) (data interface{}, ttl time.Duration, err error)
+type ShutdownActionFunc func(key, currentValue interface{})
 
 type Backend interface {
 	Store(key, value interface{})
@@ -50,6 +51,11 @@ type Config struct {
 	//
 	// This func will be called when a running manager for a key is unable to load a value from the configured backend
 	RebuildAction RebuildActionFunc
+
+	// ShutdownAction [optional]
+	//
+	// This func will be called when a running manager shuts down
+	ShutdownAction ShutdownActionFunc
 
 	// Backend [optional]
 	//
@@ -84,6 +90,7 @@ func buildConfig(inc *Config, mu ...func(*Config)) *Config {
 	}
 
 	actual.RebuildAction = inc.RebuildAction
+	actual.ShutdownAction = inc.ShutdownAction
 	actual.Backend = inc.Backend
 	actual.IdleTimeout = inc.IdleTimeout
 	actual.TimeoutBehavior = inc.TimeoutBehavior
@@ -101,6 +108,7 @@ type CacheMan struct {
 	cleanup  chan interface{}
 
 	rebuildAction RebuildActionFunc
+	shutdownAction ShutdownActionFunc
 
 	managers    map[interface{}]*keyManager
 	idleTTL     time.Duration
@@ -118,6 +126,7 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 	cm := new(CacheMan)
 
 	cm.rebuildAction = config.RebuildAction
+	cm.shutdownAction = config.ShutdownAction
 	cm.ttlBehavior = config.TimeoutBehavior
 	cm.requests = make(chan *request, 100)
 	cm.cleanup = make(chan interface{}, 100)
@@ -160,7 +169,7 @@ func (cm *CacheMan) Unmanage(key interface{}) {
 }
 
 func (cm *CacheMan) manage(key interface{}) *keyManager {
-	m := newKeyManager(cm.log, key, cm.rebuildAction, cm.be, cm.idleTTL, cm.ttlBehavior)
+	m := newKeyManager(cm.log, key, cm.rebuildAction,cm.shutdownAction, cm.be, cm.idleTTL, cm.ttlBehavior)
 	cm.managers[key] = m
 	go func() {
 		<-m.done

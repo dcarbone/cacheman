@@ -51,6 +51,7 @@ type keyManager struct {
 	key interface{}
 
 	rebuildAction RebuildActionFunc
+	shutdownAction ShutdownActionFunc
 
 	requests     chan *request
 	accessCount  uint64
@@ -66,11 +67,12 @@ type keyManager struct {
 	done chan struct{}
 }
 
-func newKeyManager(l *log.Logger, key interface{}, act RebuildActionFunc, be Backend, idleTTL time.Duration, ttlBehavior TimeoutBehavior) *keyManager {
+func newKeyManager(l *log.Logger, key interface{}, ract RebuildActionFunc, sact ShutdownActionFunc, be Backend, idleTTL time.Duration, ttlBehavior TimeoutBehavior) *keyManager {
 	km := new(keyManager)
 
 	km.key = key
-	km.rebuildAction = act
+	km.rebuildAction = ract
+	km.shutdownAction = sact
 	km.be = be
 	km.idleTTL = idleTTL
 	km.ttlBehavior = ttlBehavior
@@ -136,7 +138,10 @@ func (km *keyManager) logf(f string, v ...interface{}) {
 func (km *keyManager) shutdown() {
 	close(km.requests)
 
-	ml := len(km.requests)
+	var (
+		ml = len(km.requests)
+		v, _ = km.be.Load(km.key)
+	)
 
 	km.log.Printf(
 		"Shutting down. Final stats: unhandledRequests=%d; accessCount=%d; rebuildCount=%d; lastAccessed=%s; lastRebuilt=%s",
@@ -148,8 +153,6 @@ func (km *keyManager) shutdown() {
 	)
 
 	if ml > 0 {
-		// try to load current value to send to requests
-		v, _ := km.be.Load(km.key)
 		for req := range km.requests {
 			go respondToRequest(km.log.Printf, req, v, ErrKeyMangerClosed)
 		}
@@ -159,6 +162,10 @@ func (km *keyManager) shutdown() {
 	if km.ttlBehavior == TimeoutBehaviorDelete {
 		km.log.Printf("Timeout behavior is %q, deleting key...", km.ttlBehavior)
 		km.be.Delete(km.key)
+	}
+
+	if km.shutdownAction != nil {
+		go km.shutdownAction(km.key, v)
 	}
 
 	close(km.done)
