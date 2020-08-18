@@ -107,7 +107,7 @@ type CacheMan struct {
 	requests chan *request
 	cleanup  chan interface{}
 
-	rebuildAction RebuildActionFunc
+	rebuildAction  RebuildActionFunc
 	shutdownAction ShutdownActionFunc
 
 	managers    map[interface{}]*keyManager
@@ -169,10 +169,10 @@ func (cm *CacheMan) Unmanage(key interface{}) {
 }
 
 func (cm *CacheMan) manage(key interface{}) *keyManager {
-	m := newKeyManager(cm.log, key, cm.rebuildAction,cm.shutdownAction, cm.be, cm.idleTTL, cm.ttlBehavior)
+	m := newKeyManager(cm.log, key, cm.rebuildAction, cm.shutdownAction, cm.be, cm.idleTTL, cm.ttlBehavior)
 	cm.managers[key] = m
 	go func() {
-		<-m.done
+		<-m.Done()
 		cm.cleanup <- m.key
 	}()
 	return m

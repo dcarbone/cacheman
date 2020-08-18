@@ -50,7 +50,7 @@ type keyManager struct {
 
 	key interface{}
 
-	rebuildAction RebuildActionFunc
+	rebuildAction  RebuildActionFunc
 	shutdownAction ShutdownActionFunc
 
 	requests     chan *request
@@ -93,10 +93,13 @@ func newKeyManager(l *log.Logger, key interface{}, ract RebuildActionFunc, sact 
 
 func (km *keyManager) Done() <-chan struct{} {
 	km.mu.Lock()
+	var d chan struct{}
 	if km.done == nil {
-		km.done = make(chan struct{})
+		d = make(chan struct{})
+		close(d)
+	} else {
+		d = km.done
 	}
-	d := km.done
 	km.mu.Unlock()
 	return d
 }
@@ -113,9 +116,8 @@ func (km *keyManager) Request(req *request) {
 
 func (km *keyManager) Closed() bool {
 	km.mu.Lock()
-	c := km.closed
-	km.mu.Unlock()
-	return c
+	defer km.mu.Unlock()
+	return km.closed
 }
 
 func (km *keyManager) Close() {
@@ -135,11 +137,49 @@ func (km *keyManager) logf(f string, v ...interface{}) {
 	km.log.Printf(f, v...)
 }
 
+func (km *keyManager) respond(req *request) {
+	km.mu.Lock()
+	defer km.mu.Unlock()
+
+	var (
+		v   interface{}
+		ttl time.Duration
+		ok  bool
+		err error
+	)
+
+	km.accessCount++
+	km.lastAccessed = time.Now()
+
+	if km.closed {
+		km.log.Printf("I am closed, will not rebuild.")
+		err = ErrKeyMangerClosed
+	} else if v, ok = km.be.Load(req.key); !ok {
+		km.rebuildCount++
+		km.lastRebuilt = time.Now()
+		if v, ttl, err = km.rebuildAction(req.key); err == nil {
+			if ttl > 0 {
+				if tb, ok := km.be.(TTLBackend); ok {
+					tb.StoreFor(req.key, v, ttl)
+				} else if db, ok := km.be.(DeadlineBackend); ok {
+					db.StoreUntil(req.key, v, time.Now().Add(ttl))
+				} else {
+					km.be.Store(req.key, v)
+				}
+			} else {
+				km.be.Store(req.key, v)
+			}
+		}
+	}
+
+	go respondToRequest(km.log.Printf, req, v, err)
+}
+
 func (km *keyManager) shutdown() {
 	close(km.requests)
 
 	var (
-		ml = len(km.requests)
+		ml   = len(km.requests)
 		v, _ = km.be.Load(km.key)
 	)
 
@@ -169,6 +209,7 @@ func (km *keyManager) shutdown() {
 	}
 
 	close(km.done)
+	km.done = nil
 }
 
 func (km *keyManager) manage() {
@@ -183,47 +224,19 @@ func (km *keyManager) manage() {
 
 	km.log.Printf("Cache key manager for %v coming online.", km.key)
 
+	defer func() {
+		if !lifespan.Stop() && len(lifespan.C) > 0 {
+			<-lifespan.C
+		}
+		if !heartbeat.Stop() && len(heartbeat.C) > 0 {
+			<-heartbeat.C
+		}
+	}()
+
 	for {
 		select {
 		case req := <-km.requests:
-			var (
-				v   interface{}
-				ttl time.Duration
-				ok  bool
-				err error
-			)
-
-			km.mu.Lock()
-
-			km.accessCount++
-			km.lastAccessed = time.Now()
-
-			if v, ok = km.be.Load(req.key); !ok {
-				if km.closed {
-					km.log.Printf("Value not found but I am closed, will not rebuild.")
-					err = ErrKeyMangerClosed
-				} else {
-					km.rebuildCount++
-					km.lastRebuilt = time.Now()
-					if v, ttl, err = km.rebuildAction(req.key); err == nil {
-						if ttl > 0 {
-							if tb, ok := km.be.(TTLBackend); ok {
-								tb.StoreFor(req.key, v, ttl)
-							} else if db, ok := km.be.(DeadlineBackend); ok {
-								db.StoreUntil(req.key, v, time.Now().Add(ttl))
-							} else {
-								km.be.Store(req.key, v)
-							}
-						} else {
-							km.be.Store(req.key, v)
-						}
-					}
-				}
-			}
-
-			km.mu.Unlock()
-
-			go respondToRequest(km.log.Printf, req, v, err)
+			km.respond(req)
 
 			if !lifespan.Stop() && len(lifespan.C) > 0 {
 				<-lifespan.C
@@ -244,29 +257,19 @@ func (km *keyManager) manage() {
 
 		case <-lifespan.C:
 			km.mu.Lock()
+			km.log.Printf("I have not received a request in %q.  Shutting down...", km.idleTTL)
 			km.closed = true
+			km.shutdown()
 			km.mu.Unlock()
 
-			km.log.Printf("I have not received a request in %q.  Shutting down...", km.idleTTL)
-
-			if !heartbeat.Stop() && len(heartbeat.C) > 0 {
-				<-heartbeat.C
-			}
-
-			km.shutdown()
 			return
 
 		case <-km.close:
+			km.mu.Lock()
 			km.log.Printf("The time is %q. I've been told to close.  Shutting down...", time.Now().Format(time.Stamp))
-
-			if !lifespan.Stop() && len(lifespan.C) > 0 {
-				<-lifespan.C
-			}
-			if !heartbeat.Stop() && len(heartbeat.C) > 0 {
-				<-heartbeat.C
-			}
-
 			km.shutdown()
+			km.mu.Unlock()
+
 			return
 		}
 	}
