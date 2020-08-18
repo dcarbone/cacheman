@@ -77,7 +77,7 @@ func newKeyManager(l *log.Logger, key interface{}, ract RebuildActionFunc, sact 
 	km.idleTTL = idleTTL
 	km.ttlBehavior = ttlBehavior
 	km.requests = make(chan *request, 100)
-	km.close = make(chan struct{})
+	km.close = make(chan struct{}, 2) // needs to be buffered to prevent lock contention
 	km.done = make(chan struct{})
 
 	if l == nil {
@@ -127,10 +127,8 @@ func (km *keyManager) Close() {
 		return
 	}
 	km.closed = true
+	km.close <- struct{}{}
 	km.mu.Unlock()
-
-	close(km.close)
-	<-km.done
 }
 
 func (km *keyManager) logf(f string, v ...interface{}) {
@@ -176,12 +174,16 @@ func (km *keyManager) respond(req *request) {
 }
 
 func (km *keyManager) shutdown() {
-	close(km.requests)
+	km.mu.Lock()
+	defer km.mu.Unlock()
 
 	var (
 		ml   = len(km.requests)
 		v, _ = km.be.Load(km.key)
 	)
+
+	km.closed = true
+	close(km.requests)
 
 	km.log.Printf(
 		"Shutting down. Final stats: unhandledRequests=%d; accessCount=%d; rebuildCount=%d; lastAccessed=%s; lastRebuilt=%s",
@@ -208,6 +210,13 @@ func (km *keyManager) shutdown() {
 		go km.shutdownAction(km.key, v)
 	}
 
+	close(km.close)
+	if len(km.close) > 0 {
+		for range km.close {
+		}
+	}
+	km.close = nil
+
 	close(km.done)
 	km.done = nil
 }
@@ -225,6 +234,12 @@ func (km *keyManager) manage() {
 	km.log.Printf("Cache key manager for %v coming online.", km.key)
 
 	defer func() {
+		if v := recover(); v != nil {
+			km.log.Printf("Panic during key manager lifecycle: %v", v)
+		}
+
+		km.shutdown()
+
 		if !lifespan.Stop() && len(lifespan.C) > 0 {
 			<-lifespan.C
 		}
@@ -256,20 +271,11 @@ func (km *keyManager) manage() {
 			heartbeat.Reset(hbInterval)
 
 		case <-lifespan.C:
-			km.mu.Lock()
 			km.log.Printf("I have not received a request in %q.  Shutting down...", km.idleTTL)
-			km.closed = true
-			km.shutdown()
-			km.mu.Unlock()
-
-			return
+			km.Close()
 
 		case <-km.close:
-			km.mu.Lock()
 			km.log.Printf("The time is %q. I've been told to close.  Shutting down...", time.Now().Format(time.Stamp))
-			km.shutdown()
-			km.mu.Unlock()
-
 			return
 		}
 	}
