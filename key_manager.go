@@ -283,7 +283,7 @@ func (km *keyManager) manage() {
 
 func respondToRequest(logf func(string, ...interface{}), req *request, data interface{}, err error) {
 	logf("Responding to request for key \"%v\" with: dataType=%T; err=%v", req.key, data, err)
-	req.resp <- &response{data: data, err: err}
+	req.resp <- response{data: data, err: err}
 }
 
 func requestFromManager(logf func(string, ...interface{}), m *keyManager, req *request) {

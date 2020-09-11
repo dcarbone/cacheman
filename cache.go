@@ -17,14 +17,27 @@ var (
 	KeyManagerLogPrefixFormat = "--> cacheman-km-%v "
 )
 
+type action uint8
+
+const (
+	actionGet action = iota
+	actionUnmanage
+	actionCleanup
+	actionKeyList
+	actionFlush
+	actionPurge
+)
+
 type response struct {
 	data interface{}
 	err  error
 }
 
 type request struct {
-	key  interface{}
-	resp chan *response
+	action  action
+	purgeFn func(key interface{}) bool
+	key     interface{}
+	resp    chan response
 }
 
 type RebuildActionFunc func(key interface{}) (data interface{}, ttl time.Duration, err error)
@@ -105,7 +118,6 @@ type CacheMan struct {
 	be  Backend
 
 	requests chan *request
-	cleanup  chan interface{}
 
 	rebuildAction  RebuildActionFunc
 	shutdownAction ShutdownActionFunc
@@ -129,7 +141,6 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 	cm.shutdownAction = config.ShutdownAction
 	cm.ttlBehavior = config.TimeoutBehavior
 	cm.requests = make(chan *request, 100)
-	cm.cleanup = make(chan interface{}, 100)
 	cm.managers = make(map[interface{}]*keyManager)
 
 	if config.Logger != nil {
@@ -157,15 +168,39 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 
 // Get will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
 func (cm *CacheMan) Get(key interface{}) (interface{}, error) {
-	resp := make(chan *response, 1)
-	cm.requests <- &request{key: key, resp: resp}
+	resp := make(chan response, 1)
+	cm.requests <- &request{action: actionGet, key: key, resp: resp}
 	r := <-resp
 	close(resp)
 	return r.data, r.err
 }
 
+// Unmanage
 func (cm *CacheMan) Unmanage(key interface{}) {
-	cm.cleanup <- key
+	resp := make(chan response)
+	cm.requests <- &request{action: actionUnmanage, key: key, resp: resp}
+	<-resp
+	close(resp)
+}
+
+func (cm *CacheMan) ActiveManagerKeys() []interface{} {
+	resp := make(chan response)
+	cm.requests <- &request{action: actionKeyList, resp: resp}
+	r := <-resp
+	close(resp)
+	return r.data.([]interface{})
+}
+
+func (cm *CacheMan) Flush() {
+	resp := make(chan response)
+	cm.requests <- &request{action: actionFlush, resp: resp}
+	<-resp
+}
+
+func (cm *CacheMan) Purge(fn func(key interface{}) bool) {
+	resp := make(chan response)
+	cm.requests <- &request{action: actionPurge, purgeFn: fn, resp: resp}
+	<-resp
 }
 
 func (cm *CacheMan) manage(key interface{}) *keyManager {
@@ -173,15 +208,79 @@ func (cm *CacheMan) manage(key interface{}) *keyManager {
 	cm.managers[key] = m
 	go func() {
 		<-m.Done()
-		cm.cleanup <- m.key
+		cm.requests <- &request{action: actionCleanup, key: key}
 	}()
 	return m
+}
+
+func (cm *CacheMan) doGet(req *request) {
+	var (
+		m  *keyManager
+		ok bool
+	)
+
+	m, ok = cm.managers[req.key]
+	if !ok || m.Closed() {
+		cm.log.Printf("No active manager present for key \"%v\", creating...", req.key)
+		m = cm.manage(req.key)
+	}
+
+	go requestFromManager(cm.log.Printf, m, req)
+}
+
+func (cm *CacheMan) doUnmanage(req *request) {
+	if m, ok := cm.managers[req.key]; ok && !m.Closed() {
+		m.log.Printf("Received request to stop management of key \"%v\"...", req.key)
+		m.Close()
+	} else {
+		m.log.Printf("Received request to stop management of key \"%v\", but it either isn't in the map or has been superseded", req.key)
+	}
+}
+
+func (cm *CacheMan) doCleanup(req *request) {
+	if m, ok := cm.managers[req.key]; ok && m.Closed() {
+		cm.log.Printf("Cache key \"%v\" hasn't been hit for awhile, shutting it down...", req.key)
+		delete(cm.managers, req.key)
+	} else {
+		cm.log.Printf("Received cleanup request for manager of \"%v\", but it either isn't in the map or has been superseded.  Moving on...", req.key)
+	}
+}
+
+func (cm *CacheMan) doKeyList(req *request) {
+	keys := make([]interface{}, 0)
+	for k := range cm.managers {
+		keys = append(keys, k)
+	}
+	req.resp <- response{data: keys}
+}
+
+func (cm *CacheMan) doFlush(req *request) {
+	for _, m := range cm.managers {
+		m.Close()
+	}
+	close(req.resp)
+}
+
+func (cm *CacheMan) doPurge(req *request) {
+	if req.purgeFn == nil {
+		cm.doFlush(req)
+		return
+	}
+	for k, m := range cm.managers {
+		go func(k interface{}, m *keyManager) {
+			if req.purgeFn(k) {
+				m.Close()
+			}
+		}(k, m)
+	}
+	close(req.resp)
 }
 
 func (cm *CacheMan) run() {
 	const hbInterval = time.Minute
 
 	var (
+		req  *request
 		tick time.Time
 
 		heartbeat = time.NewTimer(hbInterval)
@@ -189,26 +288,20 @@ func (cm *CacheMan) run() {
 
 	for {
 		select {
-		case req := <-cm.requests:
-			var (
-				m  *keyManager
-				ok bool
-			)
-
-			m, ok = cm.managers[req.key]
-			if !ok || m.Closed() {
-				cm.log.Printf("No active manager present for key \"%v\", creating...", req.key)
-				m = cm.manage(req.key)
-			}
-
-			go requestFromManager(cm.log.Printf, m, req)
-
-		case key := <-cm.cleanup:
-			if m, ok := cm.managers[key]; ok && m.Closed() {
-				cm.log.Printf("Cache key \"%v\" hasn't been hit for awhile, shutting it down...", key)
-				delete(cm.managers, key)
-			} else {
-				cm.log.Printf("Received cleanup request for manager of \"%v\", but it either isn't in the map or has been superseded.  Moving on...", key)
+		case req = <-cm.requests:
+			switch req.action {
+			case actionGet:
+				cm.doGet(req)
+			case actionUnmanage:
+				cm.doUnmanage(req)
+			case actionCleanup:
+				cm.doCleanup(req)
+			case actionKeyList:
+				cm.doKeyList(req)
+			case actionPurge:
+				cm.doPurge(req)
+			case actionFlush:
+				cm.doFlush(req)
 			}
 
 		case tick = <-heartbeat.C:
