@@ -24,6 +24,8 @@ type (
 		Backend
 		StoreFor(key, value interface{}, ttl time.Duration)
 	}
+
+	storeActionFunc func(key interface{}, rebuildAction RebuildActionFunc, be Backend) (interface{}, error)
 )
 
 type Config struct {
@@ -56,14 +58,14 @@ func buildConfig(inc *Config, mu ...func(*Config)) *Config {
 }
 
 type CacheMan struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 	be Backend
 
 	rebuildAction RebuildActionFunc
+	storeAction   storeActionFunc
 }
 
 func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
-
 	config := buildConfig(c, mutators...)
 
 	if config.RebuildAction == nil {
@@ -80,27 +82,30 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 		cm.be = config.Backend
 	}
 
+	if _, ok := cm.be.(DeadlineBackend); ok {
+		cm.storeAction = storeAndLoadDeadline
+	} else if _, ok := cm.be.(TTLBackend); ok {
+		cm.storeAction = storeAndLoadTTL
+	} else {
+		cm.storeAction = storeAndLoad
+	}
+
 	return cm, nil
 }
 
 // Load will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
 func (cm *CacheMan) Load(key interface{}) (interface{}, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
 	var (
 		v   interface{}
 		ok  bool
 		err error
 	)
-
-	// attempt initial load
-	cm.mu.RLock()
 	v, ok = cm.be.Load(key)
-	cm.mu.RUnlock()
-
-	// if not found, attempt reload
 	if !ok {
-		cm.mu.Lock()
-		v, err = storeAndLoad(key, cm.rebuildAction, cm.be)
-		cm.mu.Unlock()
+		v, err = cm.storeAction(key, cm.rebuildAction, cm.be)
 	}
 
 	return v, err
@@ -109,28 +114,37 @@ func (cm *CacheMan) Load(key interface{}) (interface{}, error) {
 func storeAndLoad(key interface{}, rebuildAction RebuildActionFunc, be Backend) (interface{}, error) {
 	var (
 		v   interface{}
-		ok  bool
+		err error
+	)
+	if v, _, err = rebuildAction(key); err != nil {
+		return nil, err
+	}
+	be.Store(key, v)
+	return v, nil
+}
+
+func storeAndLoadDeadline(key interface{}, rebuildAction RebuildActionFunc, be Backend) (interface{}, error) {
+	var (
+		v   interface{}
 		ttl time.Duration
 		err error
 	)
-
-	// test for another routine getting here before i did
-	if v, ok = be.Load(key); ok {
-		return v, nil
-	}
-
-	// execute rebuild
 	if v, ttl, err = rebuildAction(key); err != nil {
 		return nil, err
 	}
+	be.(DeadlineBackend).StoreUntil(key, v, time.Now().Add(ttl))
+	return v, nil
+}
 
-	if dbe, ok := be.(DeadlineBackend); ok {
-		dbe.StoreUntil(key, v, time.Now().Add(ttl))
-	} else if tbe, ok := be.(TTLBackend); ok {
-		tbe.StoreFor(key, v, ttl)
-	} else {
-		be.Store(key, v)
+func storeAndLoadTTL(key interface{}, rebuildAction RebuildActionFunc, be Backend) (interface{}, error) {
+	var (
+		v   interface{}
+		ttl time.Duration
+		err error
+	)
+	if v, ttl, err = rebuildAction(key); err != nil {
+		return nil, err
 	}
-
+	be.(TTLBackend).StoreFor(key, v, ttl)
 	return v, nil
 }
