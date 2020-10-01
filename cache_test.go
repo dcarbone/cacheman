@@ -151,8 +151,7 @@ func TestCacheMan(t *testing.T) {
 
 		stop := time.NewTimer(20 * time.Second)
 		for i := 0; i < 1000; i++ {
-			go func(i int) {
-				r := 0
+			go func() {
 				for {
 					select {
 					case <-stop.C:
@@ -162,9 +161,8 @@ func TestCacheMan(t *testing.T) {
 						t.Fail()
 					case <-testEquals(t, m, "test", uint64(1)):
 					}
-					r++
 				}
-			}(i)
+			}()
 		}
 		<-stop.C
 	})
