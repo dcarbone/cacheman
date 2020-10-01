@@ -1,8 +1,6 @@
 package cacheman_test
 
 import (
-	"log"
-	"os"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -38,25 +36,26 @@ func (m *expirableMap) StoreUntil(key, value interface{}, deadline time.Time) {
 	}()
 }
 
-func basicRebuildAction(ttl time.Duration) cacheman.RebuildActionFunc {
-	var atomicVal uint64
+func basicRebuildAction(t *testing.T, ttl time.Duration) cacheman.RebuildActionFunc {
+	type store struct {
+		v uint64
+	}
+	st := new(store)
 	return func(_ interface{}) (interface{}, time.Duration, error) {
-		return atomic.AddUint64(&atomicVal, 1), ttl, nil
+		t.Logf("rebuilding, current=%d", atomic.LoadUint64(&st.v))
+		return atomic.AddUint64(&st.v, 1), ttl, nil
 	}
 }
 
-func defaultConfig() *cacheman.Config {
+func defaultConfig(t *testing.T) *cacheman.Config {
 	return &cacheman.Config{
-		RebuildAction:   basicRebuildAction(0),
-		Backend:         new(sync.Map),
-		IdleTimeout:     cacheman.DefaultManagerIdleTimeout,
-		TimeoutBehavior: cacheman.TimeoutBehaviorNoAction,
-		Logger:          log.New(os.Stdout, "", log.LstdFlags|log.Lmsgprefix),
+		RebuildAction: basicRebuildAction(t, 0),
+		Backend:       new(sync.Map),
 	}
 }
 
 func basicCacheMan(t *testing.T, mu ...func(*cacheman.Config)) *cacheman.CacheMan {
-	if m, err := cacheman.New(defaultConfig(), mu...); err != nil {
+	if m, err := cacheman.New(defaultConfig(t), mu...); err != nil {
 		t.Fatalf("Error constructing CacheMan: %v", err)
 		return nil
 	} else {
@@ -65,7 +64,7 @@ func basicCacheMan(t *testing.T, mu ...func(*cacheman.Config)) *cacheman.CacheMa
 }
 
 func testEquals(t *testing.T, m *cacheman.CacheMan, key, expected interface{}) {
-	if v, err := m.Get(key); err != nil {
+	if v, err := m.Load(key); err != nil {
 		t.Logf("Error getting key \"%v\": %v", key, err)
 		t.Fail()
 	} else if reflect.TypeOf(v) != reflect.TypeOf(expected) {
@@ -105,52 +104,11 @@ func TestCacheMan(t *testing.T) {
 		testEquals(t, m, "test", uint64(1))
 	})
 
-	t.Run("manager-timeout", func(t *testing.T) {
-		t.Parallel()
-
-		m := basicCacheMan(t, func(config *cacheman.Config) {
-			config.IdleTimeout = time.Second
-		})
-
-		testEquals(t, m, "test", uint64(1))
-		testEquals(t, m, "test", uint64(1))
-
-		if t.Failed() {
-			return
-		}
-
-		time.Sleep(2 * time.Second)
-
-		testEquals(t, m, "test", uint64(1))
-		testEquals(t, m, "test", uint64(1))
-	})
-
-	t.Run("manager-timeout-delete", func(t *testing.T) {
-		t.Parallel()
-
-		m := basicCacheMan(t, func(config *cacheman.Config) {
-			config.IdleTimeout = time.Second
-			config.TimeoutBehavior = cacheman.TimeoutBehaviorDelete
-		})
-
-		testEquals(t, m, "test", uint64(1))
-		testEquals(t, m, "test", uint64(1))
-
-		if t.Failed() {
-			return
-		}
-
-		time.Sleep(2 * time.Second)
-
-		testEquals(t, m, "test", uint64(2))
-		testEquals(t, m, "test", uint64(2))
-	})
-
 	t.Run("expirable-backend", func(t *testing.T) {
 		t.Parallel()
 
 		m := basicCacheMan(t, func(config *cacheman.Config) {
-			config.RebuildAction = basicRebuildAction(time.Second)
+			config.RebuildAction = basicRebuildAction(t, time.Second)
 			config.Backend = newExpirableMap()
 		})
 

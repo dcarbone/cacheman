@@ -2,62 +2,30 @@ package cacheman
 
 import (
 	"errors"
-	"io/ioutil"
 	"log"
 	"sync"
 	"time"
 )
 
-const (
-	DefaultManagerIdleTimeout = time.Hour
+type (
+	RebuildActionFunc func(key interface{}) (data interface{}, ttl time.Duration, err error)
+
+	Backend interface {
+		Store(key, value interface{})
+		Load(key interface{}) (value interface{}, ok bool)
+		Delete(key interface{})
+	}
+
+	DeadlineBackend interface {
+		Backend
+		StoreUntil(key, value interface{}, deadline time.Time)
+	}
+
+	TTLBackend interface {
+		Backend
+		StoreFor(key, value interface{}, ttl time.Duration)
+	}
 )
-
-var (
-	LogPrefix                 = "-> cacheman "
-	KeyManagerLogPrefixFormat = "--> cacheman-km-%v "
-)
-
-type action uint8
-
-const (
-	actionGet action = iota
-	actionUnmanage
-	actionCleanup
-	actionKeyList
-	actionFlush
-	actionPurge
-)
-
-type response struct {
-	data interface{}
-	err  error
-}
-
-type request struct {
-	action  action
-	purgeFn func(key interface{}) bool
-	key     interface{}
-	resp    chan response
-}
-
-type RebuildActionFunc func(key interface{}) (data interface{}, ttl time.Duration, err error)
-type ShutdownActionFunc func(key, currentValue interface{})
-
-type Backend interface {
-	Store(key, value interface{})
-	Load(key interface{}) (value interface{}, ok bool)
-	Delete(key interface{})
-}
-
-type DeadlineBackend interface {
-	Backend
-	StoreUntil(key, value interface{}, deadline time.Time)
-}
-
-type TTLBackend interface {
-	Backend
-	StoreFor(key, value interface{}, ttl time.Duration)
-}
 
 type Config struct {
 	// RebuildAction [required]
@@ -65,30 +33,10 @@ type Config struct {
 	// This func will be called when a running manager for a key is unable to load a value from the configured backend
 	RebuildAction RebuildActionFunc
 
-	// ShutdownAction [optional]
-	//
-	// This func will be called when a running manager shuts down
-	ShutdownAction ShutdownActionFunc
-
 	// Backend [optional]
 	//
 	// This is used to actually store the data.  If one is not provided, a new sync.Map instance is used.
 	Backend Backend
-
-	// IdleTimeout [optional]
-	//
-	// Amount of time for this manager and key to exist past last fetch request
-	IdleTimeout time.Duration
-
-	// TimeoutBehavior [optional]
-	//
-	// Behavior of manager timeout
-	TimeoutBehavior TimeoutBehavior
-
-	// Logger [optional]
-	//
-	// If you want logging, define this.
-	Logger *log.Logger
 }
 
 func buildConfig(inc *Config, mu ...func(*Config)) *Config {
@@ -103,28 +51,16 @@ func buildConfig(inc *Config, mu ...func(*Config)) *Config {
 	}
 
 	actual.RebuildAction = inc.RebuildAction
-	actual.ShutdownAction = inc.ShutdownAction
 	actual.Backend = inc.Backend
-	actual.IdleTimeout = inc.IdleTimeout
-	actual.TimeoutBehavior = inc.TimeoutBehavior
-	actual.Logger = inc.Logger
 
 	return actual
 }
 
 type CacheMan struct {
-	mu  sync.RWMutex
-	log *log.Logger
-	be  Backend
+	mu sync.RWMutex
+	be Backend
 
-	requests chan *request
-
-	rebuildAction  RebuildActionFunc
-	shutdownAction ShutdownActionFunc
-
-	managers    map[interface{}]*keyManager
-	idleTTL     time.Duration
-	ttlBehavior TimeoutBehavior
+	rebuildAction RebuildActionFunc
 }
 
 func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
@@ -138,16 +74,6 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 	cm := new(CacheMan)
 
 	cm.rebuildAction = config.RebuildAction
-	cm.shutdownAction = config.ShutdownAction
-	cm.ttlBehavior = config.TimeoutBehavior
-	cm.requests = make(chan *request, 100)
-	cm.managers = make(map[interface{}]*keyManager)
-
-	if config.Logger != nil {
-		cm.log = log.New(config.Logger.Writer(), LogPrefix, config.Logger.Flags())
-	} else {
-		cm.log = log.New(ioutil.Discard, LogPrefix, log.Lmsgprefix|log.LstdFlags)
-	}
 
 	if config.Backend == nil {
 		cm.be = new(sync.Map)
@@ -155,158 +81,51 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 		cm.be = config.Backend
 	}
 
-	if config.IdleTimeout > 0 {
-		cm.idleTTL = config.IdleTimeout
-	} else {
-		cm.idleTTL = DefaultManagerIdleTimeout
-	}
-
-	go cm.run()
-
 	return cm, nil
 }
 
-// Get will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
-func (cm *CacheMan) Get(key interface{}) (interface{}, error) {
-	resp := make(chan response, 1)
-	cm.requests <- &request{action: actionGet, key: key, resp: resp}
-	r := <-resp
-	close(resp)
-	return r.data, r.err
+// Load will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
+func (cm *CacheMan) Load(key interface{}) (interface{}, error) {
+	cm.mu.RLock()
+	if v, ok := cm.be.Load(key); ok {
+		log.Printf("key %v found", key)
+		cm.mu.RUnlock()
+		return v, nil
+	}
+	cm.mu.RUnlock()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.storeAndLoad(key)
 }
 
-// Unmanage
-func (cm *CacheMan) Unmanage(key interface{}) {
-	resp := make(chan response)
-	cm.requests <- &request{action: actionUnmanage, key: key, resp: resp}
-	<-resp
-	close(resp)
-}
-
-func (cm *CacheMan) ActiveManagerKeys() []interface{} {
-	resp := make(chan response)
-	cm.requests <- &request{action: actionKeyList, resp: resp}
-	r := <-resp
-	close(resp)
-	return r.data.([]interface{})
-}
-
-func (cm *CacheMan) Flush() {
-	resp := make(chan response)
-	cm.requests <- &request{action: actionFlush, resp: resp}
-	<-resp
-}
-
-func (cm *CacheMan) Purge(fn func(key interface{}) bool) {
-	resp := make(chan response)
-	cm.requests <- &request{action: actionPurge, purgeFn: fn, resp: resp}
-	<-resp
-}
-
-func (cm *CacheMan) manage(key interface{}) *keyManager {
-	m := newKeyManager(cm.log, key, cm.rebuildAction, cm.shutdownAction, cm.be, cm.idleTTL, cm.ttlBehavior)
-	cm.managers[key] = m
-	go func() {
-		<-m.Done()
-		cm.requests <- &request{action: actionCleanup, key: key}
-	}()
-	return m
-}
-
-func (cm *CacheMan) doGet(req *request) {
+func (cm *CacheMan) storeAndLoad(key interface{}) (interface{}, error) {
 	var (
-		m  *keyManager
-		ok bool
+		v   interface{}
+		ok  bool
+		ttl time.Duration
+		err error
 	)
 
-	m, ok = cm.managers[req.key]
-	if !ok || m.Closed() {
-		cm.log.Printf("No active manager present for key \"%v\", creating...", req.key)
-		m = cm.manage(req.key)
+	// test for another routine getting here before i did
+	if v, ok = cm.be.Load(key); ok {
+		log.Printf("key %v already rebuilt: %v", key, v)
+		return v, nil
 	}
 
-	go requestFromManager(cm.log.Printf, m, req)
-}
+	log.Printf("key %v rebuilding", key)
 
-func (cm *CacheMan) doUnmanage(req *request) {
-	if m, ok := cm.managers[req.key]; ok && !m.Closed() {
-		m.log.Printf("Received request to stop management of key \"%v\"...", req.key)
-		m.Close()
+	// execute rebuild
+	if v, ttl, err = cm.rebuildAction(key); err != nil {
+		return nil, err
+	}
+
+	if dbe, ok := cm.be.(DeadlineBackend); ok {
+		dbe.StoreUntil(key, v, time.Now().Add(ttl))
+	} else if tbe, ok := cm.be.(TTLBackend); ok {
+		tbe.StoreFor(key, v, ttl)
 	} else {
-		m.log.Printf("Received request to stop management of key \"%v\", but it either isn't in the map or has been superseded", req.key)
+		cm.be.Store(key, v)
 	}
-}
 
-func (cm *CacheMan) doCleanup(req *request) {
-	if m, ok := cm.managers[req.key]; ok && m.Closed() {
-		cm.log.Printf("Cache key \"%v\" hasn't been hit for awhile, shutting it down...", req.key)
-		delete(cm.managers, req.key)
-	} else {
-		cm.log.Printf("Received cleanup request for manager of \"%v\", but it either isn't in the map or has been superseded.  Moving on...", req.key)
-	}
-}
-
-func (cm *CacheMan) doKeyList(req *request) {
-	keys := make([]interface{}, 0)
-	for k := range cm.managers {
-		keys = append(keys, k)
-	}
-	req.resp <- response{data: keys}
-}
-
-func (cm *CacheMan) doFlush(req *request) {
-	for _, m := range cm.managers {
-		m.Close()
-	}
-	close(req.resp)
-}
-
-func (cm *CacheMan) doPurge(req *request) {
-	if req.purgeFn == nil {
-		cm.doFlush(req)
-		return
-	}
-	for k, m := range cm.managers {
-		go func(k interface{}, m *keyManager) {
-			if req.purgeFn(k) {
-				m.Close()
-			}
-		}(k, m)
-	}
-	close(req.resp)
-}
-
-func (cm *CacheMan) run() {
-	const hbInterval = time.Minute
-
-	var (
-		req  *request
-		tick time.Time
-
-		heartbeat = time.NewTimer(hbInterval)
-	)
-
-	for {
-		select {
-		case req = <-cm.requests:
-			switch req.action {
-			case actionGet:
-				cm.doGet(req)
-			case actionUnmanage:
-				cm.doUnmanage(req)
-			case actionCleanup:
-				cm.doCleanup(req)
-			case actionKeyList:
-				cm.doKeyList(req)
-			case actionPurge:
-				cm.doPurge(req)
-			case actionFlush:
-				cm.doFlush(req)
-			}
-
-		case tick = <-heartbeat.C:
-			cm.log.Printf("The time is %s and I'm currently holding on to %d key managers...", tick.Format(time.Kitchen), len(cm.managers))
-			heartbeat.Reset(hbInterval)
-		}
-	}
+	return v, nil
 }
