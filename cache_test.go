@@ -1,7 +1,11 @@
 package cacheman_test
 
 import (
+	"fmt"
+	"os"
 	"reflect"
+	"runtime"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,17 +67,28 @@ func basicCacheMan(t *testing.T, mu ...func(*cacheman.Config)) *cacheman.CacheMa
 	}
 }
 
-func testEquals(t *testing.T, m *cacheman.CacheMan, key, expected interface{}) {
-	if v, err := m.Load(key); err != nil {
-		t.Logf("Error getting key \"%v\": %v", key, err)
-		t.Fail()
-	} else if reflect.TypeOf(v) != reflect.TypeOf(expected) {
-		t.Logf("Key \"%v\" value type mismatch: expected=%T; actual=%T", key, expected, v)
-		t.Fail()
-	} else if expected != v {
-		t.Logf("Key \"%v\" value mismatch: expected=%v; acutal=%v", key, expected, v)
-		t.Fail()
-	}
+func testEquals(t *testing.T, m *cacheman.CacheMan, key, expected interface{}) <-chan struct{} {
+	done := make(chan struct{})
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if v, err := m.Load(key); err != nil {
+			t.Logf("Error getting key \"%v\": %v", key, err)
+			t.Fail()
+		} else if reflect.TypeOf(v) != reflect.TypeOf(expected) {
+			t.Logf("Key \"%v\" value type mismatch: expected=%T; actual=%T", key, expected, v)
+			t.Fail()
+		} else if expected != v {
+			t.Logf("Key \"%v\" value mismatch: expected=%v; acutal=%v", key, expected, v)
+			t.Fail()
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
 }
 
 func TestCacheMan(t *testing.T) {
@@ -119,5 +134,38 @@ func TestCacheMan(t *testing.T) {
 
 		testEquals(t, m, "test", uint64(2))
 		testEquals(t, m, "test", uint64(2))
+	})
+
+	t.Run("concurrent-access", func(t *testing.T) {
+		t.Parallel()
+
+		defer func() {
+			if f, err := os.Create(fmt.Sprintf("./profile/mem_%s.prof", time.Now().Format(time.RFC3339))); err == nil {
+				defer func() { _ = f.Close() }()
+				runtime.GC()
+				_ = pprof.WriteHeapProfile(f)
+			}
+		}()
+
+		m := basicCacheMan(t)
+
+		stop := time.NewTimer(20 * time.Second)
+		for i := 0; i < 1000; i++ {
+			go func(i int) {
+				r := 0
+				for {
+					select {
+					case <-stop.C:
+						return
+					case <-time.After(time.Second):
+						t.Log("load test took longer than 1 second to complete")
+						t.Fail()
+					case <-testEquals(t, m, "test", uint64(1)):
+					}
+					r++
+				}
+			}(i)
+		}
+		<-stop.C
 	})
 }

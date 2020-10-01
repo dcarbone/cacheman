@@ -2,7 +2,6 @@ package cacheman
 
 import (
 	"errors"
-	"log"
 	"sync"
 	"time"
 )
@@ -86,19 +85,28 @@ func New(c *Config, mutators ...func(*Config)) (*CacheMan, error) {
 
 // Load will fetch the requested key from the cache, calling the refresh func for this cache if the key is not found
 func (cm *CacheMan) Load(key interface{}) (interface{}, error) {
+	var (
+		v   interface{}
+		ok  bool
+		err error
+	)
+
+	// attempt initial load
 	cm.mu.RLock()
-	if v, ok := cm.be.Load(key); ok {
-		log.Printf("key %v found", key)
-		cm.mu.RUnlock()
-		return v, nil
-	}
+	v, ok = cm.be.Load(key)
 	cm.mu.RUnlock()
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.storeAndLoad(key)
+
+	// if not found, attempt reload
+	if !ok {
+		cm.mu.Lock()
+		v, err = storeAndLoad(key, cm.rebuildAction, cm.be)
+		cm.mu.Unlock()
+	}
+
+	return v, err
 }
 
-func (cm *CacheMan) storeAndLoad(key interface{}) (interface{}, error) {
+func storeAndLoad(key interface{}, rebuildAction RebuildActionFunc, be Backend) (interface{}, error) {
 	var (
 		v   interface{}
 		ok  bool
@@ -107,21 +115,21 @@ func (cm *CacheMan) storeAndLoad(key interface{}) (interface{}, error) {
 	)
 
 	// test for another routine getting here before i did
-	if v, ok = cm.be.Load(key); ok {
+	if v, ok = be.Load(key); ok {
 		return v, nil
 	}
 
 	// execute rebuild
-	if v, ttl, err = cm.rebuildAction(key); err != nil {
+	if v, ttl, err = rebuildAction(key); err != nil {
 		return nil, err
 	}
 
-	if dbe, ok := cm.be.(DeadlineBackend); ok {
+	if dbe, ok := be.(DeadlineBackend); ok {
 		dbe.StoreUntil(key, v, time.Now().Add(ttl))
-	} else if tbe, ok := cm.be.(TTLBackend); ok {
+	} else if tbe, ok := be.(TTLBackend); ok {
 		tbe.StoreFor(key, v, ttl)
 	} else {
-		cm.be.Store(key, v)
+		be.Store(key, v)
 	}
 
 	return v, nil
