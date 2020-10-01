@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dcarbone/go-cacheman"
+	"github.com/dcarbone/go-cacheman/v2"
 )
 
 type expirableMap struct {
