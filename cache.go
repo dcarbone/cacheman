@@ -108,11 +108,8 @@ func (cm *CacheMan) storeAndLoad(key interface{}) (interface{}, error) {
 
 	// test for another routine getting here before i did
 	if v, ok = cm.be.Load(key); ok {
-		log.Printf("key %v already rebuilt: %v", key, v)
 		return v, nil
 	}
-
-	log.Printf("key %v rebuilding", key)
 
 	// execute rebuild
 	if v, ttl, err = cm.rebuildAction(key); err != nil {
